@@ -1,0 +1,130 @@
+name: Fastploy Deploy
+description: Deploy a repository's fastploy.yaml to Fastploy, or promote another Environment, and wait until every service runs.
+author: Fastploy
+branding:
+  icon: upload-cloud
+  color: gray-dark
+
+inputs:
+  token:
+    description: A Fastploy REST API key, ideally a Deploy key limited to the Environment it deploys. Pass it from a secret.
+    required: true
+  command:
+    description: "deploy (the default), promote, or status, which waits for the deployment a push started."
+    default: deploy
+  environment:
+    description: The Environment to act on, by name or slug. Empty takes the one .fastploy/link.json names.
+    default: ""
+  from:
+    description: For promote, the Environment whose commit and image digests to deploy, such as staging.
+    default: ""
+  image:
+    description: Images this workflow built, one SERVICE=TAG per line, as fastploy deploy --image takes them.
+    default: ""
+  image-tag:
+    description: One tag or @sha256 digest for every service that runs an image.
+    default: ""
+  timeout:
+    description: Minutes to wait for the deployment.
+    default: "30"
+  idempotency-key:
+    description: Running again with the same key follows the deployment the first run started instead of starting another. The default is unique to this run attempt.
+    default: ${{ github.run_id }}-${{ github.run_attempt }}
+  version:
+    description: The CLI version to require, such as 0.22.0. Empty accepts the one the control plane serves, which always matches its API.
+    default: ""
+  url:
+    description: Fastploy's address.
+    default: https://app.fastploy.com
+
+outputs:
+  result:
+    description: The command's JSON document, or its error.
+    value: ${{ steps.fastploy.outputs.result }}
+  exit-code:
+    description: "0 ran, 1 failed, 2 a person must confirm, 3 not allowed, 4 build or image, 5 pre-deploy step, 6 rollout, 7 timeout."
+    value: ${{ steps.fastploy.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    # The CLI needs Node.js 22.12 or later.
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 22
+    - name: Install the Fastploy CLI
+      shell: bash
+      env:
+        FASTPLOY_URL: ${{ inputs.url }}
+        FASTPLOY_NO_SKILL: "1"
+        WANTED: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        # The script checks the release's SHA-256 before npm installs it.
+        curl --proto '=https' --tlsv1.2 -fsSL "$FASTPLOY_URL/cli/install.sh" | sh
+        installed="$(fastploy --version)"
+        if [ -n "$WANTED" ] && [ "$installed" != "$WANTED" ]; then
+          echo "::error::$FASTPLOY_URL serves Fastploy CLI $installed, not $WANTED. Update the version input."
+          exit 1
+        fi
+    - name: Run fastploy ${{ inputs.command }}
+      id: fastploy
+      shell: bash
+      env:
+        FASTPLOY_URL: ${{ inputs.url }}
+        FASTPLOY_TOKEN: ${{ inputs.token }}
+        COMMAND: ${{ inputs.command }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        FROM: ${{ inputs.from }}
+        IMAGES: ${{ inputs.image }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        TIMEOUT: ${{ inputs.timeout }}
+        KEY: ${{ inputs.idempotency-key }}
+      run: |
+        set -uo pipefail
+        args=(--json --timeout "$TIMEOUT")
+        case "$COMMAND" in
+          deploy)
+            args=(deploy --yes --idempotency-key "$KEY" "${args[@]}")
+            [ -n "$ENVIRONMENT" ] && args+=(--environment "$ENVIRONMENT")
+            [ -n "$IMAGE_TAG" ] && args+=(--image-tag "$IMAGE_TAG")
+            while IFS= read -r image; do
+              [ -n "$image" ] && args+=(--image "$image")
+            done <<< "$IMAGES"
+            ;;
+          promote)
+            [ -n "$FROM" ] || { echo "::error::promote needs the from input."; exit 1; }
+            args=(promote --yes --from "$FROM" --idempotency-key "$KEY" "${args[@]}")
+            [ -n "$ENVIRONMENT" ] && args+=(--to "$ENVIRONMENT")
+            ;;
+          status)
+            args=(status --commit "$GITHUB_SHA" --wait "${args[@]}")
+            [ -n "$ENVIRONMENT" ] && args+=(--environment "$ENVIRONMENT")
+            ;;
+          *)
+            echo "::error::command must be deploy, promote or status, not $COMMAND."
+            exit 1
+            ;;
+        esac
+        fastploy "${args[@]}" > "$RUNNER_TEMP/fastploy.json"
+        code=$?
+        delimiter="FASTPLOY_$(openssl rand -hex 8)"
+        {
+          echo "result<<$delimiter"
+          cat "$RUNNER_TEMP/fastploy.json"
+          echo "$delimiter"
+          echo "exit-code=$code"
+        } >> "$GITHUB_OUTPUT"
+        node -e '
+          const result = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+          const deployment = result.deployment ?? result;
+          const lines = result.error
+            ? [`**Fastploy ${process.argv[2]} failed** (${result.error.code}): ${result.error.message}`]
+            : [
+                `**Fastploy ${process.argv[2]}**: ${deployment.status ?? "done"}${deployment.commitSha ? ` at ${deployment.commitSha.slice(0, 7)}` : ""}`,
+                ...(deployment.services ?? []).map((service) =>
+                  `- ${service.name}: ${service.status}${service.urls?.length ? ` ${service.urls.join(" ")}` : ""}${service.errorMessage ? ` — ${service.errorMessage}` : ""}`),
+              ];
+          require("node:fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+        ' "$RUNNER_TEMP/fastploy.json" "$COMMAND" || true
+        exit "$code"
